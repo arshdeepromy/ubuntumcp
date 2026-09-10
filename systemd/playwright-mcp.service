@@ -1,0 +1,33 @@
+[Unit]
+Description=Playwright MCP (browser automation over MCP, streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+Environment=PLAYWRIGHT_BROWSERS_PATH=%h/.cache/ms-playwright
+# --shared-browser-context is load-bearing: the bridge opens a fresh MCP
+# connection per tool call, and without it every call would land in a brand new
+# browser context (about:blank), so nothing would survive between steps.
+# --allowed-hosts is needed because playwright-mcp checks the Host header and
+# otherwise 403s anything that dials 127.0.0.1 instead of the literal 'localhost'.
+ExecStart=/usr/local/bin/playwright-mcp \
+  --port 8931 \
+  --host 127.0.0.1 \
+  --allowed-hosts localhost:8931,127.0.0.1:8931 \
+  --headless \
+  --browser chromium \
+  --shared-browser-context \
+  --user-data-dir %h/.cache/playwright-mcp-profile \
+  --output-dir %h/.cache/playwright-mcp-output \
+  --viewport-size 1280,800
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=playwright-mcp
+
+[Install]
+WantedBy=default.target
+

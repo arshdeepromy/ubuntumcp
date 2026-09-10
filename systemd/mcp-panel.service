@@ -1,0 +1,17 @@
+[Unit]
+Description=MCP Bridge control panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/mcp-bridge
+ExecStart=%h/mcp-bridge/.venv/bin/python -m panel
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-panel
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Opens the MCP Bridge control panel as a desktop app window.
+# Starts the panel service first if it isn't already up.
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ENV_FILE="$HOME/.mcp-bridge/bridge.env"
+PORT=$(grep -oP '^MCP_BRIDGE_PANEL_PORT=\K.*' "$ENV_FILE" 2>/dev/null || echo 8900)
+
+# With MCP_BRIDGE_PANEL_BIND=lan the panel binds only to the LAN address, so
+# loopback is dead. Probe both and keep whichever answers.
+LAN=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
+URL="http://127.0.0.1:$PORT"
+
+is_up() {
+  for host in 127.0.0.1 ${LAN:-}; do
+    if curl -fsS --max-time 2 "http://$host:$PORT/" >/dev/null 2>&1; then
+      URL="http://$host:$PORT"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! is_up; then
+  # Prefer the user service so the panel keeps running after the window closes.
+  if systemctl --user list-unit-files mcp-panel.service &>/dev/null \
+     && systemctl --user cat mcp-panel.service &>/dev/null; then
+    systemctl --user start mcp-panel.service
+  else
+    setsid nohup "$DIR/.venv/bin/python" -m panel \
+      >>"$HOME/.mcp-bridge/panel.log" 2>&1 </dev/null &
+  fi
+  for _ in $(seq 1 20); do is_up && break; sleep 0.5; done
+fi
+
+if ! is_up; then
+  echo "Control panel did not start. Last log lines:" >&2
+  tail -n 20 "$HOME/.mcp-bridge/panel.log" 2>/dev/null >&2 || true
+  exit 1
+fi
+
+# An app-mode window has no address bar or tabs, so it reads as a native app.
+for browser in brave google-chrome chromium chromium-browser microsoft-edge; do
+  if command -v "$browser" >/dev/null 2>&1; then
+    exec "$browser" --app="$URL" --class=MCPBridge --window-size=1100,880
+  fi
+done
+
+# No Chromium-family browser: fall back to whatever handles http.
+if command -v xdg-open >/dev/null 2>&1; then
+  exec xdg-open "$URL"
+fi
+
+echo "Control panel running at $URL"

@@ -1,0 +1,27 @@
+[Unit]
+Description=MCP Bridge (remote administration endpoint for Claude)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=MCP_USER
+Group=MCP_USER
+WorkingDirectory=MCP_HOME/mcp-bridge
+EnvironmentFile=MCP_HOME/.mcp-bridge/bridge.env
+ExecStart=MCP_HOME/mcp-bridge/.venv/bin/python -m bridge
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-bridge
+
+# The bridge is meant to run commands, so it cannot be locked down hard.
+# These limit blast radius from a crash without breaking its purpose.
+NoNewPrivileges=no
+PrivateTmp=no
+ProtectHome=no
+ProtectSystem=off
+
+[Install]
+WantedBy=multi-user.target

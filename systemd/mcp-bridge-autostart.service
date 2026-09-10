@@ -1,0 +1,18 @@
+[Unit]
+Description=MCP Bridge endpoint (autostart via the panel supervisor)
+After=network-online.target mcp-panel.service
+Wants=network-online.target
+
+# Type=oneshot on purpose: the supervisor owns the bridge process and its
+# pidfile, so the panel's Start/Stop buttons stay authoritative. systemd only
+# kicks it off at boot; it does not supervise or fight with the panel.
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/mcp-bridge
+ExecStart=%h/mcp-bridge/.venv/bin/python -m panel.supervisor start
+ExecStop=%h/mcp-bridge/.venv/bin/python -m panel.supervisor stop
+SyslogIdentifier=mcp-bridge-autostart
+
+[Install]
+WantedBy=default.target

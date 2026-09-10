@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+# runtime state and secrets live in ~/.mcp-bridge, never in the repo
+.mcp-bridge/
+*.env
+*.db
+*.log
+*.pid
+*.secret
