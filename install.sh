@@ -54,6 +54,9 @@ if (( PYV < 310 )); then
   echo "Python 3.10+ is required (found $(python3 --version)). Use Ubuntu 22.04 or newer." >&2
   exit 1
 fi
+# python3-venv doesn't always pull in the versioned package (ensurepip lives there).
+PYDOT=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "python${PYDOT}-venv" || true
 
 step "Creating Python virtualenv"
 cd "$DIR"

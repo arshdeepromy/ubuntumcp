@@ -1,6 +1,6 @@
 # Installing on another Ubuntu machine
 
-Tested layout: Ubuntu 22.04 / 24.04 / 26.04, a normal user account with sudo.
+Needs Ubuntu 22.04 or newer (developed on 26.04) and a normal user account with sudo.
 Everything runs as that user; nothing needs to be run as root directly.
 
 ## 1. Install
