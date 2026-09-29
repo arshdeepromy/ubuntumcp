@@ -1,114 +1,103 @@
-# Installing on another Ubuntu machine
+# Installing on another Linux PC
 
-Needs Ubuntu 22.04 or newer (developed on 26.04) and a normal user account with sudo.
-Everything runs as that user; nothing needs to be run as root directly.
+This archive is the MCP bridge that Claude connects to as the **kiro box**
+connector: an authenticated MCP endpoint that exposes shell access and a set of
+structured system tools (`system_overview`, `read_journal`, `service_status`,
+`network_overview`, `disk_usage`, `read_file`, `write_file`, `run_command`,
+`service_control`, `top_processes`, `list_directory`), plus a web control panel
+for starting, stopping and configuring it.
 
-## 1. Install
+## What is and isn't in the box
+
+Included: all source, the control panel, the systemd units, the tunnel helpers
+and the installer.
+
+**Not** included, deliberately:
+
+- `.venv/` — a virtualenv hardcodes the absolute path and Python version of the
+  machine that built it, so `install.sh` builds a fresh one on the target.
+- `~/.mcp-bridge/` — the config, database, audit log and **secrets**. The
+  bearer token and operator passphrase are per-machine and are generated on
+  first run. Nothing from the source machine is carried over.
+
+## Requirements
+
+- Linux with systemd (built and tested on Ubuntu 26.04)
+- Python >= 3.11, including the `venv` module
+  (`sudo apt install -y python3 python3-venv`)
+- Network access for `pip install` during setup
+- `cloudflared` only if you want Tunnel mode
+
+## Install
 
 ```bash
-sudo apt-get install -y git
-git clone https://github.com/arshdeepromy/ubuntumcp.git ~/mcp-bridge
-cd ~/mcp-bridge
-bash install.sh --with-sudo        # drop --with-sudo if you don't want passwordless sudo
+unzip mcp-bridge-<version>.zip
+cd mcp-bridge
+bash install.sh
 ```
 
-The clone **must** end up at `~/mcp-bridge` (the systemd user units point there).
+That creates `.venv`, installs the pinned dependencies, generates
+`~/.mcp-bridge/bridge.env` with a fresh passphrase and bearer token, installs
+the control panel as a user service, and adds "MCP Bridge" to the application
+menu. It finishes by printing the panel URL, the endpoint and the token.
 
-`install.sh` does the following:
+Use `bash install.sh --no-app` to skip the service and menu entry.
 
-| Step | What |
+## Then
+
+```bash
+bash bridgectl.sh start       # start the bridge
+bash bridgectl.sh status      # endpoint, token, recent activity
+mcp-bridge-gui                # open the control panel
+```
+
+Connect a client on the same LAN:
+
+```bash
+claude mcp add --transport http kiro-box http://<host-ip>:8901/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+For claude.ai in a browser, LAN mode will not work — custom connectors are
+fetched by Anthropic's servers, which cannot route to a private address. Switch
+to Tunnel mode (`bash setup-tunnel.sh mcp.yourdomain.com`), which also turns on
+OAuth and the consent screen.
+
+## Ports
+
+| Port | What |
 |---|---|
-| apt | python3, venv, pip, git, curl, sqlite3 |
-| Python | `.venv` + pinned `requirements.txt` |
-| Browser tools | Node 18+ (NodeSource if apt's is too old), `@playwright/mcp@0.0.79` globally, Chromium + its system libs |
-| Services | user units `playwright-mcp`, `mcp-panel`, `mcp-bridge-autostart`, all enabled |
-| Lingering | `loginctl enable-linger` so it all survives logout and reboot |
-| Desktop | "MCP Bridge" launcher in the app menu |
-| `--with-sudo` | `/etc/sudoers.d/99-mcp-bridge` (passwordless sudo for this user) |
+| 8900 | control panel |
+| 8901 | MCP endpoint |
+| 8932 | Playwright MCP OAuth proxy (optional, `pwproxy`) |
 
-On first start a fresh `~/.mcp-bridge/bridge.env` is generated with a **new**
-passphrase and bearer token. Nothing is shared with any other machine.
+Change them in the panel or in `~/.mcp-bridge/bridge.env`.
 
-Check it:
+## Optional pieces
 
-```bash
-bash bridgectl.sh status
-systemctl --user status mcp-panel mcp-bridge-autostart playwright-mcp --no-pager
-curl -s http://127.0.0.1:8901/healthz
-```
+- `sudo bash install-sudoers.sh` — passwordless sudo for this account, required
+  for tool calls with `sudo=true`. Read the warning in that file first: it
+  applies to *every* process running as the user, not only the bridge.
+- `systemd/pw-mcp-proxy.service` — the Playwright MCP OAuth proxy. It needs a
+  Playwright MCP server of your own on `127.0.0.1:8931` and its own settings in
+  `~/.mcp-bridge/pwproxy.env`; it is not set up by `install.sh`.
+- `systemd/mcp-bridge.service` — run the bridge as its own user service instead
+  of letting the panel supervise it. The units use `%h`, so they work for any
+  user: `cp systemd/mcp-bridge.service ~/.config/systemd/user/ && systemctl --user enable --now mcp-bridge`.
 
-## 2a. Connect from your LAN (Claude Code / Desktop / Cursor)
-
-Default mode is **LAN + bearer token**. On the client machine:
+## Uninstall
 
 ```bash
-claude mcp add --transport http <name> "$(ssh user@host 'bash ~/mcp-bridge/bridgectl.sh endpoint')" \
-  --header "Authorization: Bearer <token from: bash bridgectl.sh token>"
-```
-
-Or open the panel at `http://<machine-ip>:8900`, sign in with
-`bash bridgectl.sh passphrase`, and copy the ready-made command.
-If ufw is on: `sudo ufw allow 8900/tcp && sudo ufw allow 8901/tcp`.
-
-## 2b. Connect from claude.ai (browser) — Tunnel mode
-
-claude.ai can't reach LAN addresses, so you need a public HTTPS hostname.
-Pick one:
-
-### Option A — Cloudflare dashboard tunnel (recommended; easiest to manage)
-
-1. Cloudflare Zero Trust → Networks → Tunnels → **Create tunnel** (cloudflared).
-   Copy the install token.
-2. On the machine:
-   ```bash
-   curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-   echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
-     | sudo tee /etc/apt/sources.list.d/cloudflared.list
-   sudo apt-get update -y && sudo apt-get install -y cloudflared
-   sudo cloudflared service install <TOKEN>
-   ```
-3. In the tunnel → **Public hostname**: e.g. `mcp2.yourdomain.com` → service `http://127.0.0.1:8901`.
-4. In the MCP Bridge panel (Network/Access): Mode **Tunnel**, Auth **OAuth**,
-   Public URL `https://mcp2.yourdomain.com`, then **Restart**.
-   Or by hand:
-   ```bash
-   sed -i -e 's|^MCP_BRIDGE_MODE=.*|MCP_BRIDGE_MODE=tunnel|' \
-          -e 's|^MCP_BRIDGE_AUTH_MODE=.*|MCP_BRIDGE_AUTH_MODE=oauth|' \
-          -e 's|^MCP_BRIDGE_PUBLIC_URL=.*|MCP_BRIDGE_PUBLIC_URL=https://mcp2.yourdomain.com|' \
-          ~/.mcp-bridge/bridge.env
-   bash bridgectl.sh restart
-   curl -s https://mcp2.yourdomain.com/healthz
-   ```
-5. claude.ai → Settings → Connectors → **Add custom connector** →
-   `https://mcp2.yourdomain.com/mcp` → approve on the consent page using the passphrase.
-
-### Option B — `setup-tunnel.sh` (CLI-managed named tunnel)
-
-`bash setup-tunnel.sh mcp2.yourdomain.com` logs cloudflared in, creates the
-tunnel and DNS route, and installs **system** units `mcp-bridge` +
-`mcp-bridge-tunnel`. If you use this, disable the user autostart so two
-bridges don't fight over port 8901:
-`systemctl --user disable --now mcp-bridge-autostart`.
-
-### Option C — throwaway URL
-
-`bash quick-tunnel.sh` — trycloudflare.com URL, changes every run.
-
-## Updating
-
-```bash
-cd ~/mcp-bridge && git pull
-.venv/bin/pip install -r requirements.txt -q
-bash bridgectl.sh restart
-```
-
-## Uninstalling
-
-```bash
-systemctl --user disable --now mcp-bridge-autostart mcp-panel playwright-mcp
-bash ~/mcp-bridge/bridgectl.sh stop
-rm -f ~/.config/systemd/user/{mcp-bridge-autostart,mcp-panel,playwright-mcp}.service
+systemctl --user disable --now mcp-panel mcp-bridge 2>/dev/null
+rm -f ~/.config/systemd/user/mcp-{panel,bridge}.service
 rm -f ~/.local/share/applications/mcp-bridge.desktop ~/.local/bin/mcp-bridge-gui
-sudo bash ~/mcp-bridge/install-sudoers.sh --remove
-rm -rf ~/mcp-bridge ~/.mcp-bridge            # the second one holds the secrets
+sudo bash install-sudoers.sh --remove     # if you installed it
+rm -rf ~/.mcp-bridge                      # config, secrets, audit log
+rm -rf <this directory>
 ```
+
+## Read the security note
+
+`README.md` ends with a section on what this actually grants. It is full
+command execution including sudo, reachable over the network. Read it before
+exposing the endpoint anywhere.

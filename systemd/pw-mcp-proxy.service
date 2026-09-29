@@ -1,18 +1,17 @@
 [Unit]
-Description=MCP Bridge (remote administration endpoint for Claude)
+Description=Playwright MCP OAuth proxy (public /mcp, gated, -> localhost:8931)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=%h/mcp-bridge
-EnvironmentFile=%h/.mcp-bridge/bridge.env
-ExecStart=%h/mcp-bridge/.venv/bin/python -m bridge
+ExecStart=%h/mcp-bridge/.venv/bin/python -m pwproxy
 Restart=on-failure
-RestartSec=5
+RestartSec=3s
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=mcp-bridge
+SyslogIdentifier=pw-mcp-proxy
 
 [Install]
 WantedBy=default.target

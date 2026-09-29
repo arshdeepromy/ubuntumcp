@@ -1,3 +1,3 @@
-"""MCP bridge connector for remote administration of this Ubuntu host."""
+"""MCP bridge connector for remote administration of this Linux host."""
 
 __version__ = "1.0.0"

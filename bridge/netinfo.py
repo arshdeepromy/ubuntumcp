@@ -54,13 +54,32 @@ def is_private(host: str) -> bool:
         return False
 
 
+BIND_KEYWORDS = ("lan", "all", "loopback")
+
+
+def is_valid_bind(value: str) -> bool:
+    """True if `value` is a bind keyword or a literal IP address."""
+    if value in BIND_KEYWORDS:
+        return True
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
+
+
 def resolve_bind(mode: str) -> str:
     """Map a bind mode to a concrete address to listen on."""
+    mode = (mode or "").strip()
     if mode == "loopback":
         return "127.0.0.1"
     if mode == "all":
         return "0.0.0.0"
-    if mode == "lan":
+    # Anything unset or unrecognised falls back to the documented default. It
+    # used to be returned verbatim as "an explicit address", so an empty
+    # setting produced an empty host and a URL like "http://:8901" that only
+    # failed later, deep in URL validation, with the bridge already down.
+    if mode == "lan" or not is_valid_bind(mode):
         return primary_lan_ip() or "0.0.0.0"
     return mode  # an explicit address was configured
 

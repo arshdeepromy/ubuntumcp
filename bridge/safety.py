@@ -13,6 +13,7 @@ import getpass
 import re
 from dataclasses import dataclass
 
+# The account the bridge runs as; guarded so a command cannot lock you out.
 _ME = re.escape(getpass.getuser())
 
 # (compiled pattern, human explanation)
@@ -34,7 +35,8 @@ _RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bchown\s+-[a-zA-Z]*[rR][a-zA-Z]*\s+\S+\s+/(\s|$)"), "recursive chown of /"),
     (re.compile(r"\b(halt|poweroff)\b|\bshutdown\b(?!.*-c)|\bsystemctl\s+(poweroff|halt)\b"),
      "powering the machine off (you would lose the tunnel and all access)"),
-    (re.compile(rf"\buserdel\s+.*\b{_ME}\b|\bpasswd\s+-l\s+{_ME}\b"), "locking or deleting your own account"),
+    (re.compile(rf"\buserdel\s+.*\b{_ME}\b|\bpasswd\s+-l\s+{_ME}\b"),
+     "locking or deleting your own account"),
     (re.compile(r"\bufw\s+.*\bdeny\b.*\bout\b|\biptables\s+-[AI]\s+OUTPUT\s+.*DROP"),
      "blocking outbound traffic (would kill the tunnel)"),
     (re.compile(r"\bsystemctl\s+(stop|disable|mask)\s+.*(cloudflared|mcp-bridge)"),

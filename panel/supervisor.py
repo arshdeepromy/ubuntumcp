@@ -7,6 +7,8 @@ lets the panel re-attach to a running bridge after the panel itself restarts.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import signal
 import sqlite3
@@ -254,22 +256,171 @@ def install_sudoers(password: str) -> tuple[bool, str]:
     return False, detail[-1][:200] if detail else f"Installer exited {proc.returncode}."
 
 
-def remove_sudoers(password: str) -> tuple[bool, str]:
+def remove_sudoers(password: str = "") -> tuple[bool, str]:
     script = PROJECT_ROOT / "install-sudoers.sh"
+    # Turning it OFF needs root, but if passwordless sudo is currently ON the
+    # bridge already has that -- so no password is needed to switch it off. Only
+    # fall back to the account password if passwordless isn't working (an
+    # already-half-removed state).
+    if not password and passwordless_sudo_works():
+        cmd = ["sudo", "-n", "bash", str(script), "--remove"]
+        stdin = None
+    elif password:
+        cmd = ["sudo", "-S", "-p", "", "bash", str(script), "--remove"]
+        stdin = password + "\n"
+    else:
+        return False, "Account password required to turn sudo off."
     try:
-        proc = subprocess.run(
-            ["sudo", "-S", "-p", "", "bash", str(script), "--remove"],
-            input=password + "\n", capture_output=True, text=True, timeout=60,
-        )
+        proc = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=60)
     except subprocess.SubprocessError as exc:
         return False, f"Failed: {exc}"
     if proc.returncode == 0:
-        return True, "Passwordless sudo removed. sudo needs a password again."
+        return True, "Passwordless sudo turned off. Privileged tool calls now fail."
     stderr = (proc.stderr or "").lower()
     if any(marker in stderr for marker in
            ("authentication failed", "incorrect password", "sorry, try again")):
         return False, "Incorrect password."
     return False, "Could not remove the rule."
+
+
+def _token_ref(token: str) -> str:
+    """A stable short handle for a token that never exposes the secret itself.
+
+    The panel lists and kills tokens by this ref, so the raw bearer value never
+    has to travel to the browser or sit in the DOM.
+    """
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def _client_like(client_id: str) -> str:
+    # Token/code/pending rows store the owner as `"client_id": "<id>"` inside
+    # their JSON blob (json.dumps default separators put a space after the colon).
+    return f'%"client_id": "{client_id}"%'
+
+
+def list_principals() -> dict:
+    """Configured OAuth clients and their live access tokens, for the panel.
+
+    Read straight from the SQLite store (like active_oauth_tokens), so it works
+    whether the bridge is up or down. Only unexpired access tokens are listed --
+    that is what "valid tokens" means to an operator.
+    """
+    db = STATE_DIR / "bridge.db"
+    empty = {"clients": [], "tokens": []}
+    if not db.exists():
+        return empty
+    now = time.time()
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            names: dict[str, str] = {}
+            clients = []
+            for r in conn.execute(
+                "SELECT client_id, data, created FROM clients ORDER BY created DESC"
+            ):
+                try:
+                    d = json.loads(r["data"])
+                except (ValueError, TypeError):
+                    d = {}
+                name = d.get("client_name") or "(unnamed)"
+                names[r["client_id"]] = name
+                live = conn.execute(
+                    "SELECT COUNT(*) FROM tokens WHERE kind='access' "
+                    "AND expires > ? AND data LIKE ?",
+                    (now, _client_like(r["client_id"])),
+                ).fetchone()[0]
+                clients.append({
+                    "client_id": r["client_id"],
+                    "client_name": name,
+                    "redirect_uris": d.get("redirect_uris", []),
+                    "created": int(r["created"]) if r["created"] else None,
+                    "live_tokens": live,
+                })
+            tokens = []
+            for r in conn.execute(
+                "SELECT token, data, expires FROM tokens "
+                "WHERE kind='access' AND expires > ? ORDER BY expires",
+                (now,),
+            ):
+                try:
+                    d = json.loads(r["data"])
+                except (ValueError, TypeError):
+                    d = {}
+                cid = d.get("client_id", "")
+                tokens.append({
+                    "ref": _token_ref(r["token"]),
+                    "prefix": r["token"][:10],
+                    "client_id": cid,
+                    "client_name": names.get(cid) or (cid[:8] if cid else "unknown"),
+                    "expires_seconds": round(r["expires"] - now),
+                })
+            return {"clients": clients, "tokens": tokens}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return empty
+
+
+def delete_client(client_id: str) -> tuple[bool, int]:
+    """Remove a client registration and cascade every credential it owns.
+
+    Returns (removed, tokens_removed). Live transport sessions for the client are
+    torn down too when the bridge is running, so the kill takes effect at once
+    instead of waiting for the next (now-401) request.
+    """
+    db = STATE_DIR / "bridge.db"
+    if not db.exists():
+        return False, 0
+    like = _client_like(client_id)
+    try:
+        conn = sqlite3.connect(db)
+        try:
+            existed = conn.execute(
+                "SELECT COUNT(*) FROM clients WHERE client_id = ?", (client_id,)
+            ).fetchone()[0]
+            if not existed:
+                return False, 0
+            ntok = conn.execute(
+                "SELECT COUNT(*) FROM tokens WHERE data LIKE ?", (like,)
+            ).fetchone()[0]
+            conn.execute("DELETE FROM tokens WHERE data LIKE ?", (like,))
+            conn.execute("DELETE FROM auth_codes WHERE data LIKE ?", (like,))
+            conn.execute("DELETE FROM pending WHERE data LIKE ?", (like,))
+            conn.execute("DELETE FROM clients WHERE client_id = ?", (client_id,))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False, 0
+    if is_running():
+        admin_request("POST", "/admin/terminate-client", {"client_id": client_id})
+    return True, ntok
+
+
+def revoke_token(ref: str) -> bool:
+    """Delete the single access token whose ref matches. Its client keeps its
+    registration and any other tokens; the next request on this one gets 401."""
+    db = STATE_DIR / "bridge.db"
+    if not db.exists():
+        return False
+    try:
+        conn = sqlite3.connect(db)
+        try:
+            target = None
+            for (token,) in conn.execute("SELECT token FROM tokens WHERE kind='access'"):
+                if _token_ref(token) == ref:
+                    target = token
+                    break
+            if target is None:
+                return False
+            conn.execute("DELETE FROM tokens WHERE token = ?", (target,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 def revoke_all_tokens() -> int:

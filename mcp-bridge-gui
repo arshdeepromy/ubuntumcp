@@ -6,21 +6,9 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 ENV_FILE="$HOME/.mcp-bridge/bridge.env"
 PORT=$(grep -oP '^MCP_BRIDGE_PANEL_PORT=\K.*' "$ENV_FILE" 2>/dev/null || echo 8900)
-
-# With MCP_BRIDGE_PANEL_BIND=lan the panel binds only to the LAN address, so
-# loopback is dead. Probe both and keep whichever answers.
-LAN=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
 URL="http://127.0.0.1:$PORT"
 
-is_up() {
-  for host in 127.0.0.1 ${LAN:-}; do
-    if curl -fsS --max-time 2 "http://$host:$PORT/" >/dev/null 2>&1; then
-      URL="http://$host:$PORT"
-      return 0
-    fi
-  done
-  return 1
-}
+is_up() { curl -fsS --max-time 2 "$URL/" >/dev/null 2>&1; }
 
 if ! is_up; then
   # Prefer the user service so the panel keeps running after the window closes.

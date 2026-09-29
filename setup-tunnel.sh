@@ -42,10 +42,8 @@ else
 fi
 
 echo "Installing systemd units..."
-sed -e "s|MCP_USER|$USER|g" -e "s|MCP_HOME|$HOME|g" "$DIR/systemd/mcp-bridge.service" \
-  | sudo tee /etc/systemd/system/mcp-bridge.service >/dev/null
-sed -e "s|MCP_TUNNEL_NAME|$TUNNEL_NAME|" -e "s|MCP_USER|$USER|g" \
-    -e "s|/usr/local/bin/cloudflared|$(command -v cloudflared)|" "$DIR/systemd/mcp-bridge-tunnel.service" \
+sudo cp "$DIR/systemd/mcp-bridge.service" /etc/systemd/system/
+sed "s|MCP_TUNNEL_NAME|$TUNNEL_NAME|" "$DIR/systemd/mcp-bridge-tunnel.service" \
   | sudo tee /etc/systemd/system/mcp-bridge-tunnel.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now mcp-bridge.service mcp-bridge-tunnel.service

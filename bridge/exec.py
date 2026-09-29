@@ -12,6 +12,38 @@ from dataclasses import dataclass, field
 from . import audit, registry, safety
 from .config import Config
 
+# Shown in chat when a sudo command is attempted but passwordless sudo is off.
+# The whole point of the operator's chosen model: the password is entered in the
+# panel, on the host, never pasted into this conversation.
+SUDO_OFF_MESSAGE = (
+    "Passwordless sudo is currently OFF, so this privileged command did not run.\n\n"
+    "To enable it, the operator opens the MCP Bridge control panel, goes to\n"
+    "'Privileged access', and turns on 'Passwordless sudo' (entering the account\n"
+    "account password there -- it stays on the host and is never sent through this\n"
+    "chat). Once it's on, re-run the command.\n\n"
+    "Ask the operator to enable it in the panel. Do NOT ask them to paste their\n"
+    "password here -- it is entered only in the panel."
+)
+
+
+async def _passwordless_sudo_ok() -> bool:
+    """True if `sudo -n` runs without a password right now.
+
+    Cheap: `-n` never prompts, so this returns immediately whether or not the
+    NOPASSWD rule is present. Checked per call so a panel toggle takes effect at
+    once, with no restart.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "true",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return await asyncio.wait_for(proc.wait(), timeout=5) == 0
+    except (OSError, asyncio.TimeoutError):
+        return False
+
 
 @dataclass
 class Result:
@@ -25,11 +57,14 @@ class Result:
     cwd: str = ""
     used_sudo: bool = False
     blocked_reason: str = ""
+    sudo_off: bool = False
     aborted: bool = False
     notes: list[str] = field(default_factory=list)
 
     def to_text(self) -> str:
         """Render for the model: status header, then streams."""
+        if self.sudo_off:
+            return SUDO_OFF_MESSAGE
         if self.blocked_reason:
             return (
                 f"BLOCKED by guardrails: {self.blocked_reason}\n"
@@ -93,8 +128,15 @@ async def run(
                           used_sudo=sudo, blocked_reason=verdict.reason)
 
     if sudo and not cfg.allow_sudo:
-        return Result(command, None, "", "", 0, cwd=workdir,
-                      blocked_reason="sudo is disabled (MCP_BRIDGE_ALLOW_SUDO=false)")
+        return Result(command, None, "", "", 0, cwd=workdir, used_sudo=True,
+                      sudo_off=True)
+
+    # Fail fast with an actionable message instead of running the command and
+    # letting sudo reject it half-way -- no partial side effects, and the model
+    # is told exactly how to get it enabled.
+    if sudo and not await _passwordless_sudo_ok():
+        return Result(command, None, "", "", 0, cwd=workdir, used_sudo=True,
+                      sudo_off=True)
 
     if not os.path.isdir(workdir):
         return Result(command, None, "", f"cwd does not exist: {workdir}", 0, cwd=workdir)
@@ -169,9 +211,9 @@ async def run(
         "password is required" in stderr or "interactive authentication is required" in stderr
     ):
         result.notes.append(
-            "sudo needs a password -- the NOPASSWD sudoers rule is not installed. "
-            "Run install-sudoers.sh from a local terminal on the host. "
-            "Until then, only non-sudo commands will work."
+            "Passwordless sudo went off part-way through this command. Ask the "
+            "operator to re-enable it in the control panel (Privileged access -> "
+            "Passwordless sudo), then retry."
         )
     audit.record("command.end", principal=principal, command=command, sudo=sudo,
                  exit_code=proc.returncode, duration_ms=duration, timed_out=timed_out)

@@ -5,9 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=MCP_USER
-Group=MCP_USER
-# TUNNEL_NAME is set by setup-tunnel.sh when it writes this file into place.
+# MCP_TUNNEL_NAME is substituted by setup-tunnel.sh when it writes this file
+# into place; MCP_BRIDGE_PORT must match the port in ~/.mcp-bridge/bridge.env.
 ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --url http://127.0.0.1:8901 MCP_TUNNEL_NAME
 Restart=on-failure
 RestartSec=5
@@ -16,4 +15,4 @@ StandardError=journal
 SyslogIdentifier=mcp-tunnel
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

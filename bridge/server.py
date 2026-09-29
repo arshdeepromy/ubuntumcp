@@ -5,6 +5,9 @@ from __future__ import annotations
 import hmac
 import html
 import logging
+import os
+import time
+from pathlib import Path
 
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
@@ -54,6 +57,17 @@ _PAGE = """
 """
 
 
+def _distro() -> str:
+    """The running distribution, e.g. 'Ubuntu 26.04'. Falls back to 'Linux'."""
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                return line.partition("=")[2].strip().strip('"') or "Linux"
+    except OSError:
+        pass
+    return "Linux"
+
+
 def _render(title: str, body: str, status: int = 200) -> HTMLResponse:
     return HTMLResponse(_PAGE.format(title=html.escape(title), body=body), status_code=status)
 
@@ -94,11 +108,11 @@ def build_app(cfg: Config):
 
     server = MCPServer(
         name="ubuntu-bridge",
-        title=f"Ubuntu Bridge ({__import__('os').uname().nodename})",
+        title=f"{_distro()} Bridge ({os.uname().nodename})",
         version="1.0.0",
         **auth_kwargs,
         instructions=(
-            "You are connected to an Ubuntu 26.04 machine over an authenticated "
+            f"You are connected to a {_distro()} machine over an authenticated "
             "tunnel. You can inspect and change the system, including with sudo.\n\n"
             "Working style:\n"
             "- Diagnose before you change. Read logs and status first.\n"
@@ -176,16 +190,24 @@ def build_app(cfg: Config):
         supplied = request.headers.get("x-bridge-admin", "")
         return bool(supplied) and hmac.compare_digest(supplied, cfg.admin_passphrase)
 
+    # When each session was first seen, so the panel can show a connection age.
+    # The SDK transport carries no connect time, so we stamp it ourselves and
+    # prune ids that have gone away.
+    _session_seen: dict[str, float] = {}
+
+    def _manager():
+        try:
+            return server.session_manager
+        except Exception:  # noqa: BLE001 - not started yet
+            return None
+
     def _live_sessions() -> list[str]:
         """Session IDs known to the transport manager (private SDK attribute).
 
         Terminated transports linger in the manager's dict until its own cleanup
         runs, so filter them out or the count over-reports connections.
         """
-        try:
-            manager = server.session_manager
-        except Exception:  # noqa: BLE001 - not started yet
-            return []
+        manager = _manager()
         instances = getattr(manager, "_server_instances", None)
         if not isinstance(instances, dict):
             return []
@@ -194,15 +216,59 @@ def build_app(cfg: Config):
             if not getattr(transport, "is_terminated", False)
         ]
 
+    def _session_details(sessions: list[str], commands: list[dict]) -> list[dict]:
+        """Per-session view: which client owns it, how long it's been up, and
+        whether it is running a command right now."""
+        manager = _manager()
+        owners = getattr(manager, "_session_owners", {}) or {}
+        now = time.time()
+
+        live = set(sessions)
+        for sid in list(_session_seen):
+            if sid not in live:
+                _session_seen.pop(sid, None)
+
+        # Map the registry's principal ("client:xxxxxxxx") back to sessions.
+        busy_by_principal = {c.get("principal"): c for c in commands}
+
+        details = []
+        for sid in sessions:
+            first = _session_seen.setdefault(sid, now)
+            owner = owners.get(sid) or {}
+            client_id = owner.get("client_id") or ""
+            subject = owner.get("subject") or ""
+            # exec.py stamps the principal as client:{(subject or client)[:8]}.
+            principal = "client:" + (subject or client_id or "?")[:8]
+            cmd = busy_by_principal.get(principal)
+            if client_id == "lan-static-token":
+                name = "LAN bearer token"
+            else:
+                name = store.client_name(client_id) or (client_id[:8] if client_id else "unknown")
+            expiry = store.token_expiry(client_id) if client_id else None
+            details.append({
+                "id": sid[:12],
+                "client_id": client_id[:8] if client_id else None,
+                "client_name": name,
+                "connected_seconds": round(now - first),
+                "busy": cmd is not None,
+                "command": cmd.get("command") if cmd else None,
+                "token_expires_seconds": round(expiry - now) if expiry else None,
+            })
+        # Longest-connected first -- stable ordering the panel can rely on.
+        details.sort(key=lambda d: -d["connected_seconds"])
+        return details
+
     @server.custom_route("/admin/status", methods=["GET"])
     async def admin_status(request):
         if not _admin_ok(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         sessions = _live_sessions()
+        commands = registry.snapshot()
         return JSONResponse({
-            "running_commands": registry.snapshot(),
+            "running_commands": commands,
             "sessions": len(sessions),
             "session_ids": [s[:12] for s in sessions],
+            "session_details": _session_details(sessions, commands),
             "registered_clients": store.client_count(),
             "active_tokens": store.active_tokens(),
             "auth_mode": cfg.auth_mode,
@@ -262,6 +328,39 @@ def build_app(cfg: Config):
                        "Clients reconnect automatically.",
         })
 
+    @server.custom_route("/admin/terminate-client", methods=["POST"])
+    async def admin_terminate_client(request):
+        """Tear down every live transport owned by one client.
+
+        The panel calls this right after it deletes the client from the store, so
+        an operator's "kill client" drops the open session immediately rather than
+        leaving it in the live list until its next (now unauthorized) request.
+        """
+        if not _admin_ok(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        body = await request.json() if await request.body() else {}
+        client_id = body.get("client_id")
+        if not client_id:
+            return JSONResponse({"ok": False, "message": "client_id required."})
+
+        manager = _manager()
+        owners = getattr(manager, "_session_owners", {}) or {}
+        instances = getattr(manager, "_server_instances", {}) or {}
+        terminated = 0
+        for sid, owner in list(owners.items()):
+            if (owner or {}).get("client_id") != client_id:
+                continue
+            transport = instances.get(sid)
+            if transport is None:
+                continue
+            try:
+                await transport.terminate()
+                terminated += 1
+            except Exception:  # noqa: BLE001 - keep going through the rest
+                logger.exception("failed to terminate transport for killed client")
+        audit.record("admin.client_terminated", client_id=client_id, sessions=terminated)
+        return JSONResponse({"ok": True, "terminated": terminated})
+
     @server.custom_route("/healthz", methods=["GET"])
     async def healthz(_request):
         return JSONResponse({
@@ -276,8 +375,8 @@ def build_app(cfg: Config):
     @server.custom_route("/", methods=["GET"])
     async def index(_request):
         return _render(
-            "Ubuntu MCP Bridge",
-            "<h1>Ubuntu MCP Bridge</h1><p>This is an MCP server endpoint, not a "
+            "MCP Bridge",
+            "<h1>MCP Bridge</h1><p>This is an MCP server endpoint, not a "
             f"website. Add <code>{html.escape(cfg.public_url)}/mcp</code> as a custom "
             "connector in Claude.</p>",
         )

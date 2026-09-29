@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import platform
+import re
 import secrets
 import time
 from collections import defaultdict
@@ -23,7 +24,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from bridge import netinfo
+from bridge import audit, netinfo
 from bridge.config import STATE_DIR, ensure_initialized, read_env_file, write_env_file
 
 from . import supervisor
@@ -88,11 +89,17 @@ def _client_ip(request: Request) -> str:
 # routes
 # --------------------------------------------------------------------------- #
 
+# The page carries its own JS inline, so a cached copy keeps running old code
+# after the service is updated -- and the panel looks broken in ways the server
+# can't explain. Never cache it.
+_NO_CACHE = {"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"}
+
+
 async def index(request: Request) -> Response:
     if not _authed(request):
         page = LOGIN_PAGE.replace("__HOSTNAME__", os.uname().nodename).replace("__ERROR__", "")
-        return HTMLResponse(page)
-    return HTMLResponse(PANEL_PAGE)
+        return HTMLResponse(page, headers=_NO_CACHE)
+    return HTMLResponse(PANEL_PAGE, headers=_NO_CACHE)
 
 
 async def login(request: Request) -> Response:
@@ -176,16 +183,54 @@ async def status(request: Request) -> Response:
     })
 
 
+# Kept regardless of prefix: an operator needs to see anything that was
+# refused, even though it isn't a shell command.
+_ALWAYS_KEEP = re.compile(r"blocked|denied|rejected|revoked")
+
+
 def _audit_entries(limit: int = 40) -> list[dict]:
-    out = []
-    for line in supervisor.tail_audit(limit):
+    """Recent command activity, newest first.
+
+    Every command writes a `command.start` and later a `command.end`; the two
+    are paired so one command is one row carrying its exit code and duration.
+    A start with no end yet is marked running. OAuth chatter and routine tool
+    calls are filtered out, but anything blocked/denied/rejected is kept.
+    """
+    # Read a wide window: pairing and filtering both consume lines, so tailing
+    # exactly `limit` would return far fewer than `limit` rows.
+    lines = supervisor.tail_audit(limit * 12)[::-1]  # oldest first, to pair
+    pending: dict[tuple, dict] = {}
+    rows: list[dict] = []
+
+    for line in lines:
         try:
             entry = json.loads(line)
         except ValueError:
             continue
+        event = entry.get("event", "")
+        key = (entry.get("principal"), entry.get("command"))
+
+        if event == "command.start":
+            entry["running"] = True
+            pending[key] = entry
+            rows.append(entry)
+        elif event == "command.end":
+            start = pending.pop(key, None)
+            if start is None:
+                rows.append(entry)          # end without a start in this window
+                continue
+            # Collapse onto the row already queued, keeping its start time.
+            start.update(event=event, running=False,
+                         exit_code=entry.get("exit_code"),
+                         duration_ms=entry.get("duration_ms"),
+                         timed_out=entry.get("timed_out"))
+        elif event.startswith(("command.", "admin.")) or _ALWAYS_KEEP.search(event):
+            rows.append(entry)
+
+    rows = rows[::-1][:limit]                # newest first
+    for entry in rows:
         entry["time"] = entry.get("ts", "")[11:19]
-        out.append(entry)
-    return out
+    return rows
 
 
 async def control(request: Request) -> Response:
@@ -205,7 +250,12 @@ async def settings(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
 
-    port = int(body.get("port", 8901))
+    # An empty number field arrives as null (parseInt("") is NaN), so fall back
+    # to the default rather than raising on int(None).
+    try:
+        port = int(body.get("port") or 8901)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "message": "Port must be a number."})
     if not 1 <= port <= 65535:
         return JSONResponse({"ok": False, "message": "Port must be 1–65535."})
     if port < 1024 and os.geteuid() != 0:
@@ -217,9 +267,21 @@ async def settings(request: Request) -> Response:
         return JSONResponse({"ok": False,
                              "message": f"Port {port} is used by this control panel."})
 
-    mode = body.get("mode", "lan")
-    auth_mode = str(body.get("auth_mode", "token"))
+    # `.get(key, default)` only falls back when the key is absent; a form that
+    # posts an empty string would otherwise write that empty value straight
+    # through to the config and take the bridge down on the next start.
+    mode = str(body.get("mode") or "lan")
+    auth_mode = str(body.get("auth_mode") or "token")
+    bind = str(body.get("bind") or "lan")
     public_url = str(body.get("public_url", "")).strip().rstrip("/")
+
+    if mode not in ("lan", "tunnel"):
+        return JSONResponse({"ok": False, "message": f"Unknown access mode: {mode!r}."})
+    if auth_mode not in ("token", "oauth"):
+        return JSONResponse({"ok": False, "message": f"Unknown auth mode: {auth_mode!r}."})
+    if not netinfo.is_valid_bind(bind):
+        return JSONResponse({"ok": False, "message":
+                             f"{bind!r} is not a valid listen address."})
     if mode == "tunnel":
         if not public_url:
             return JSONResponse({"ok": False,
@@ -235,14 +297,20 @@ async def settings(request: Request) -> Response:
             "OAuth needs HTTPS, which a plain LAN address cannot provide. "
             "Use bearer-token auth for LAN, or switch to Tunnel mode for OAuth."})
 
-    timeout = int(body.get("timeout", 60))
+    try:
+        timeout = int(body.get("timeout") or 60)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "message": "Timeout must be a number."})
     write_env_file({
         "MCP_BRIDGE_MODE": mode,
-        "MCP_BRIDGE_BIND": str(body.get("bind", "lan")),
+        "MCP_BRIDGE_BIND": bind,
         "MCP_BRIDGE_PORT": str(port),
         "MCP_BRIDGE_AUTH_MODE": auth_mode,
         "MCP_BRIDGE_PUBLIC_URL": public_url,
-        "MCP_BRIDGE_ALLOW_SUDO": "true" if body.get("allow_sudo") else "false",
+        # Sudo is gated by the sudoers rule (Privileged access card), not this
+        # flag, so the bridge is always willing to attempt it; whether it
+        # succeeds depends on whether passwordless sudo is turned on there.
+        "MCP_BRIDGE_ALLOW_SUDO": "true",
         "MCP_BRIDGE_GUARDRAILS": "true" if body.get("guardrails") else "false",
         "MCP_BRIDGE_TIMEOUT": str(max(5, min(timeout, 3600))),
     })
@@ -284,6 +352,48 @@ async def revoke(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     count = supervisor.revoke_all_tokens()
     return JSONResponse({"ok": True, "message": f"Revoked {count} session(s)."})
+
+
+async def principals(request: Request) -> Response:
+    """Configured OAuth clients and their live tokens, for the manage lists."""
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    data = supervisor.list_principals()
+    return JSONResponse({
+        **data,
+        "auth_mode": read_env_file().get("MCP_BRIDGE_AUTH_MODE", "token"),
+    })
+
+
+async def delete_client(request: Request) -> Response:
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json() if await request.body() else {}
+    client_id = str(body.get("client_id", "")).strip()
+    if not client_id:
+        return JSONResponse({"ok": False, "message": "No client specified."})
+    removed, ntok = supervisor.delete_client(client_id)
+    if not removed:
+        return JSONResponse({"ok": False, "message": "That client is already gone."})
+    audit.record("admin.client_deleted", principal="operator", via="panel",
+                 client_id=client_id, tokens_removed=ntok)
+    return JSONResponse({
+        "ok": True,
+        "message": f"Removed client and {ntok} token(s).",
+    })
+
+
+async def revoke_token(request: Request) -> Response:
+    if not _authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    body = await request.json() if await request.body() else {}
+    ref = str(body.get("ref", "")).strip()
+    if not ref:
+        return JSONResponse({"ok": False, "message": "No token specified."})
+    if not supervisor.revoke_token(ref):
+        return JSONResponse({"ok": False, "message": "That token is already gone."})
+    audit.record("admin.token_revoked", principal="operator", via="panel", ref=ref)
+    return JSONResponse({"ok": True, "message": "Token revoked."})
 
 
 async def live(request: Request) -> Response:
@@ -333,11 +443,12 @@ async def sudo_install(request: Request) -> Response:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
     password = str(body.get("password", ""))
-    if not password:
-        return JSONResponse({"ok": False, "message": "Account password required."})
     if body.get("remove"):
+        # Turning off needs no password when passwordless sudo is already on.
         ok, message = supervisor.remove_sudoers(password)
     else:
+        if not password:
+            return JSONResponse({"ok": False, "message": "Account password required."})
         ok, message = supervisor.install_sudoers(password)
     # Deliberately not audited: the audit log must never contain a password, and
     # the action itself is visible in /etc/sudoers.d.
@@ -352,6 +463,9 @@ async def service_log(request: Request) -> Response:
 
 def build_panel() -> Starlette:
     ensure_initialized()
+    # So panel-side admin actions (killing a client or token) land in the same
+    # audit log the bridge writes, and show up in the Activity feed.
+    audit.init(STATE_DIR / "audit.log")
     # Starlette matches in order, so every literal path must precede the
     # /api/{action} catch-all or it gets swallowed by it.
     return Starlette(routes=[
@@ -363,6 +477,9 @@ def build_panel() -> Starlette:
         Route("/api/passphrase", passphrase, methods=["POST"]),
         Route("/api/token/rotate", rotate_token, methods=["POST"]),
         Route("/api/revoke", revoke, methods=["POST"]),
+        Route("/api/principals", principals),
+        Route("/api/client/delete", delete_client, methods=["POST"]),
+        Route("/api/token/revoke", revoke_token, methods=["POST"]),
         Route("/api/log", service_log),
         Route("/api/live", live),
         Route("/api/abort", abort, methods=["POST"]),

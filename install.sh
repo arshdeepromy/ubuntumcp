@@ -1,127 +1,119 @@
 #!/usr/bin/env bash
-# One-shot installer for a fresh Ubuntu machine.
+# One-shot installer for a fresh Linux machine.
 #
-#   git clone https://github.com/arshdeepromy/ubuntumcp.git ~/mcp-bridge
-#   cd ~/mcp-bridge && bash install.sh [--with-sudo] [--no-browser]
+#   bash install.sh              # venv + deps + config + panel service + menu entry
+#   bash install.sh --no-app     # venv + deps + config only, no service or .desktop
 #
-#   --with-sudo    also grant this user passwordless sudo (so sudo=true tool
-#                  calls work). Read install-sudoers.sh before using this.
-#   --no-browser   skip Playwright/Chromium (the 23 browser_* tools won't work)
-#
-# Run as your normal user, NOT with sudo. It will ask for your password when
-# it needs root (apt, npm -g, lingering).
+# Everything lands under your home directory; no sudo is needed for this script.
+# The venv is built here rather than shipped because a virtualenv bakes in the
+# absolute path and Python version of the machine that created it.
 set -euo pipefail
 
-WITH_SUDO=0; WITH_BROWSER=1
-for arg in "$@"; do
-  case "$arg" in
-    --with-sudo)  WITH_SUDO=1 ;;
-    --no-browser) WITH_BROWSER=0 ;;
-    -h|--help)    sed -n '2,14p' "$0"; exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 1 ;;
-  esac
-done
-
-if [[ $EUID -eq 0 ]]; then
-  echo "Run this as your normal user (not root / sudo). It calls sudo itself." >&2
-  exit 1
-fi
-
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOME_DIR="$HOME/mcp-bridge"
-UNITS="$HOME/.config/systemd/user"
-PW_VERSION="0.0.79"   # @playwright/mcp version known to work with bridge/browser.py
+VENV="$DIR/.venv"
+STATE="${MCP_BRIDGE_STATE:-$HOME/.mcp-bridge}"
+MIN_PY="3.11"
 
-step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
-# The user units reference %h/mcp-bridge, so the code must live (or be linked) there.
-if [[ "$DIR" != "$HOME_DIR" ]]; then
-  if [[ -e "$HOME_DIR" && "$(readlink -f "$HOME_DIR")" != "$DIR" ]]; then
-    echo "$HOME_DIR already exists and is not this checkout. Clone into ~/mcp-bridge instead." >&2
-    exit 1
+# --- 1. interpreter ----------------------------------------------------------
+PY=""
+for c in python3.14 python3.13 python3.12 python3.11 python3; do
+  command -v "$c" >/dev/null 2>&1 || continue
+  if "$c" -c "import sys;raise SystemExit(0 if sys.version_info>=tuple(int(x) for x in '$MIN_PY'.split('.')) else 1)"; then
+    PY="$c"; break
   fi
-  ln -sfn "$DIR" "$HOME_DIR"
-  echo "Linked $HOME_DIR -> $DIR"
-fi
+done
+[[ -n "$PY" ]] || die "need Python >= $MIN_PY. On Debian/Ubuntu: sudo apt install -y python3 python3-venv"
+say "Using $("$PY" -V) at $(command -v "$PY")"
 
-step "Installing system packages"
-sudo apt-get update -y
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  python3 python3-venv python3-pip git curl sqlite3 iproute2 ca-certificates
-
-PYV=$(python3 -c 'import sys;print("%d%02d"%sys.version_info[:2])')
-if (( PYV < 310 )); then
-  echo "Python 3.10+ is required (found $(python3 --version)). Use Ubuntu 22.04 or newer." >&2
-  exit 1
-fi
-# python3-venv doesn't always pull in the versioned package (ensurepip lives there).
-PYDOT=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "python${PYDOT}-venv" || true
-
-step "Creating Python virtualenv"
-cd "$DIR"
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip -q
-.venv/bin/pip install -r requirements.txt -q
-.venv/bin/python -c "import bridge.config, panel.app; print('python deps OK')"
-
-if (( WITH_BROWSER )); then
-  step "Installing Node.js + Playwright MCP (browser tools)"
-  NODE_MAJOR=$(node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || echo 0)
-  if [[ -z "$NODE_MAJOR" || "$NODE_MAJOR" -lt 18 ]]; then
-    # Ubuntu 22.04's apt node is too old; use NodeSource LTS.
-    curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+# --- 2. venv + dependencies -------------------------------------------------
+# Three ways in, because `python3 -m venv` alone fails on any Debian/Ubuntu that
+# ships python3 without the separately packaged ensurepip.
+USED_UV=0
+if [[ ! -x "$VENV/bin/python" ]]; then
+  say "Creating virtualenv in .venv ..."
+  if "$PY" -m venv "$VENV" 2>/dev/null; then
+    :
+  elif command -v uv >/dev/null 2>&1 && uv venv --python "$PY" "$VENV"; then
+    USED_UV=1
+  elif "$PY" -m venv --without-pip "$VENV" 2>/dev/null; then
+    # venv works, only ensurepip is missing -- bootstrap pip straight into it.
+    say "ensurepip unavailable; bootstrapping pip ..."
+    BOOTSTRAP="$(mktemp)"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$BOOTSTRAP"
+    else
+      wget -qO "$BOOTSTRAP" https://bootstrap.pypa.io/get-pip.py
+    fi
+    "$VENV/bin/python" "$BOOTSTRAP" >/dev/null
+    rm -f "$BOOTSTRAP"
+  else
+    rm -rf "$VENV"
+    die "could not create a virtualenv. Install the venv package and retry:
+    sudo apt install -y python3-venv      # Debian/Ubuntu
+    sudo dnf install -y python3-virtualenv # Fedora/RHEL"
   fi
-  command -v npm >/dev/null || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y npm
-  sudo npm install -g "@playwright/mcp@$PW_VERSION"
-  NPM_ROOT=$(npm root -g)
-  PW_CLI="$NPM_ROOT/@playwright/mcp/node_modules/playwright/cli.js"
-  [[ -f "$PW_CLI" ]] || PW_CLI="$NPM_ROOT/playwright/cli.js"
-  PW_BIN=$(command -v playwright-mcp || echo "$NPM_ROOT/@playwright/mcp/cli.js")
-  # Use the playwright bundled with @playwright/mcp so the browser build matches.
-  sudo node "$PW_CLI" install-deps chromium
-  PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" node "$PW_CLI" install chromium
-
-  mkdir -p "$UNITS"
-  sed "s|/usr/local/bin/playwright-mcp|$PW_BIN|" systemd/playwright-mcp.service > "$UNITS/playwright-mcp.service"
 fi
 
-step "Keeping services running while logged out"
-sudo loginctl enable-linger "$USER"
-
-# Over SSH there may be no user bus yet; lingering starts one at /run/user/UID.
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-for _ in $(seq 1 10); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 1; done
-
-step "Installing user services (panel, bridge autostart)"
-mkdir -p "$UNITS"
-cp systemd/mcp-bridge-autostart.service "$UNITS/"
-bash "$DIR/install-app.sh"          # panel service + desktop launcher; creates ~/.mcp-bridge/bridge.env
-systemctl --user daemon-reload
-if (( WITH_BROWSER )); then systemctl --user enable --now playwright-mcp.service; fi
-systemctl --user enable --now mcp-bridge-autostart.service
-
-if (( WITH_SUDO )); then
-  step "Granting passwordless sudo to $USER"
-  sudo bash "$DIR/install-sudoers.sh" --yes
+say "Installing dependencies (needs network) ..."
+if [[ $USED_UV -eq 1 ]]; then
+  VIRTUAL_ENV="$VENV" uv pip install -r "$DIR/requirements.txt"
+else
+  "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
+  "$VENV/bin/python" -m pip install -r "$DIR/requirements.txt"
 fi
 
-if command -v ufw >/dev/null && sudo ufw status | grep -q 'Status: active'; then
-  echo
-  echo "ufw is active. To reach the panel/bridge from your LAN run:"
-  echo "    sudo ufw allow 8900/tcp && sudo ufw allow 8901/tcp"
+# Fail here rather than at first run if something did not land.
+"$VENV/bin/python" -c 'import mcp, psutil, pydantic, starlette, uvicorn, httpx' \
+  || die "dependencies did not install cleanly; see the pip output above."
+
+# --- 3. first-run config -----------------------------------------------------
+# Generates ~/.mcp-bridge/bridge.env with a fresh passphrase and bearer token.
+# Secrets are never shipped in this package; each machine makes its own.
+say "Initializing configuration in $STATE ..."
+( cd "$DIR" && "$VENV/bin/python" -c 'from bridge.config import ensure_initialized; ensure_initialized()' )
+
+# --- 4. desktop app + panel service -----------------------------------------
+if [[ "${1:-}" != "--no-app" ]]; then
+  say "Installing control panel service and menu entry ..."
+  bash "$DIR/install-app.sh"
 fi
 
-sleep 3
-step "Done"
-bash "$DIR/bridgectl.sh" status || true
-cat <<MSG
+# --- 5. what to do next ------------------------------------------------------
+get() { grep -oP "^$1=\K.*" "$STATE/bridge.env" 2>/dev/null || true; }
+LAN=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo 127.0.0.1)
 
-Control panel:   http://$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo 127.0.0.1):8900
-Passphrase:      bash bridgectl.sh passphrase
-Bearer token:    bash bridgectl.sh token
-MCP endpoint:    bash bridgectl.sh endpoint
+cat <<TXT
 
-For claude.ai in a browser you need Tunnel mode -- see INSTALL.md.
-MSG
+$(printf '\033[1mInstalled.\033[0m')
+
+  Control panel   http://$LAN:$(get MCP_BRIDGE_PANEL_PORT)
+  Passphrase      $(get MCP_BRIDGE_PASSPHRASE)
+  MCP endpoint    http://$LAN:$(get MCP_BRIDGE_PORT)/mcp
+  Bearer token    $(get MCP_BRIDGE_TOKEN)
+
+Start the bridge itself from the panel, or:
+
+  bash bridgectl.sh start
+  bash bridgectl.sh status
+
+Connect Claude Code from any machine on this LAN:
+
+  claude mcp add --transport http kiro-box http://$LAN:$(get MCP_BRIDGE_PORT)/mcp \\
+    --header "Authorization: Bearer $(get MCP_BRIDGE_TOKEN)"
+
+For claude.ai in a browser you need Tunnel mode -- a LAN address is not
+routable from Anthropic's servers. See README.md, then:
+
+  bash setup-tunnel.sh mcp.yourdomain.com
+
+Privileged tool calls (sudo=true) need passwordless sudo for this account:
+
+  sudo bash install-sudoers.sh
+
+Keep the panel running while logged out:
+
+  sudo loginctl enable-linger $USER
+TXT

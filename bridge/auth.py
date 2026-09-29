@@ -123,6 +123,24 @@ class Store:
         )
         return rows[0]["n"] if rows else 0
 
+    def client_name(self, client_id: str) -> str | None:
+        rows = self._exec("SELECT data FROM clients WHERE client_id = ?", (client_id,))
+        if not rows:
+            return None
+        try:
+            return json.loads(rows[0]["data"]).get("client_name")
+        except (ValueError, KeyError):
+            return None
+
+    def token_expiry(self, client_id: str) -> float | None:
+        """Expiry of the soonest-expiring live access token for a client."""
+        rows = self._exec(
+            "SELECT MIN(expires) AS e FROM tokens "
+            "WHERE kind='access' AND expires > ? AND data LIKE ?",
+            (time.time(), f'%"client_id": "{client_id}"%'),
+        )
+        return rows[0]["e"] if rows and rows[0]["e"] else None
+
     def revoke_all(self) -> int:
         rows = self._exec("SELECT COUNT(*) AS n FROM tokens", ())
         n = rows[0]["n"] if rows else 0

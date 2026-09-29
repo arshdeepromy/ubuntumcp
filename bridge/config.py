@@ -122,14 +122,24 @@ class Config:
         return f"{self.public_url}/mcp"
 
 
+def _setting(key: str, default: str) -> str:
+    """A setting, treating present-but-empty as unset.
+
+    `os.environ.get(key, default)` only falls back when the key is absent, so a
+    blank line in the env file (`MCP_BRIDGE_BIND=`) would otherwise be read as a
+    real value and propagate into the advertised URL.
+    """
+    return (os.environ.get(key) or "").strip().lower() or default
+
+
 def load_config() -> Config:
     ensure_initialized()
     _load_into_environ()
 
-    mode = os.environ.get("MCP_BRIDGE_MODE", "lan").strip().lower()
-    auth_mode = os.environ.get("MCP_BRIDGE_AUTH_MODE", "token").strip().lower()
-    port = int(os.environ.get("MCP_BRIDGE_PORT", "8901"))
-    bind_host = netinfo.resolve_bind(os.environ.get("MCP_BRIDGE_BIND", "lan"))
+    mode = _setting("MCP_BRIDGE_MODE", "lan")
+    auth_mode = _setting("MCP_BRIDGE_AUTH_MODE", "token")
+    port = int(_setting("MCP_BRIDGE_PORT", "8901"))
+    bind_host = netinfo.resolve_bind(_setting("MCP_BRIDGE_BIND", "lan"))
 
     if mode == "tunnel":
         public_url = os.environ.get("MCP_BRIDGE_PUBLIC_URL", "").rstrip("/")
