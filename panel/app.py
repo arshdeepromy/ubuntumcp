@@ -112,7 +112,7 @@ async def login(request: Request) -> Response:
     supplied = str(body.get("passphrase", ""))
     expected = read_env_file().get("MCP_BRIDGE_PASSPHRASE", "")
 
-    if not expected or not hmac.compare_digest(supplied, expected):
+    if not expected or not hmac.compare_digest(supplied.encode(), expected.encode()):
         _attempts[ip].append(time.time())
         remaining = MAX_ATTEMPTS - len(_attempts[ip])
         return JSONResponse(

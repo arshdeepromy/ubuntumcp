@@ -188,7 +188,7 @@ def build_app(cfg: Config):
 
     def _admin_ok(request) -> bool:
         supplied = request.headers.get("x-bridge-admin", "")
-        return bool(supplied) and hmac.compare_digest(supplied, cfg.admin_passphrase)
+        return bool(supplied) and hmac.compare_digest(supplied.encode(), cfg.admin_passphrase.encode())
 
     # When each session was first seen, so the panel can show a connection age.
     # The SDK transport carries no connect time, so we stamp it ourselves and

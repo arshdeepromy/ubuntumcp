@@ -163,7 +163,7 @@ class StaticTokenVerifier(TokenVerifier):
     async def verify_token(self, token: str) -> AccessToken | None:
         if not self.cfg.static_token:
             return None
-        if not hmac.compare_digest(token, self.cfg.static_token):
+        if not hmac.compare_digest(token.encode(), self.cfg.static_token.encode()):
             audit.record("auth.token_rejected", presented_prefix=token[:8])
             return None
         return AccessToken(
@@ -232,7 +232,7 @@ class BridgeAuthProvider(
         if pending is None:
             return False, "This approval request expired or was already used."
 
-        if not hmac.compare_digest(passphrase, self.cfg.admin_passphrase):
+        if not hmac.compare_digest(passphrase.encode(), self.cfg.admin_passphrase.encode()):
             audit.record("oauth.consent_denied", request_id=request_id,
                          reason="bad passphrase", client_id=pending["client_id"])
             return False, "Incorrect passphrase."
